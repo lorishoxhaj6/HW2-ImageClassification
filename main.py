@@ -24,7 +24,7 @@ OUT.mkdir(exist_ok=True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
-SEED = 42
+SEED = 24
 NUM_CLASSES = 37
 BATCH_SIZE = 32
 EPOCHS = 10
