@@ -25,7 +25,6 @@ source venv/bin/activate
 # Install project dependencies
 pip install -r requirements.txt
 ```
-# Environment
 
 ## Environment
 
