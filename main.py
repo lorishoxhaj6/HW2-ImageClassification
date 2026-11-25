@@ -1,16 +1,13 @@
 import json
 import os
-import platform
 import random
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import sklearn
 import torch
 import torch.nn as nn
-import torchvision
 from PIL import Image
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
@@ -24,8 +21,10 @@ from torchvision import datasets, models, transforms
 ROOT = "./data"
 OUT = Path("results")
 OUT.mkdir(exist_ok=True)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-SEED = 24
+
+SEED = 42
 NUM_CLASSES = 37
 BATCH_SIZE = 32
 EPOCHS = 10
@@ -34,20 +33,23 @@ LEARNING_RATE = {"full": 1e-4, "head": 1e-3}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def set_seed():
+    """Seeds Python, NumPy and PyTorch (CPU and GPU) with SEED so that runs are reproducible."""
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
+    torch.use_deterministic_algorithms(True, warn_only=True)   # a few CUDA ops have no deterministic version
+
 
 
 set_seed()
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-
-# Data
+# Data preparation
 # Preprocessing comes from the pre-trained weights: resize 256 -> center-crop 224 -> ImageNet mean/std.
 # Augmentation (random horizontal flip) is applied to the training set only.
+# Reuse the preprocessing expected by the pretrained MobileNetV3 weights.
 weights = models.MobileNet_V3_Small_Weights.DEFAULT
 eval_transform = weights.transforms()
 train_transform = transforms.Compose([transforms.RandomHorizontalFlip(), eval_transform])
@@ -65,17 +67,21 @@ labels = np.array(trainval_plain._labels)
 train_idx, val_idx = train_test_split(np.arange(len(labels)), test_size=0.2,
                                       stratify=labels, random_state=SEED)
 
+# save a JSON audit file of train and val indices for reproducibility
 with open(OUT / "split.json", "w") as f:
     json.dump({"seed": SEED, "train": train_idx.tolist(), "val": val_idx.tolist()}, f)
 
+# Training uses augmented images; evaluation uses the same images without augmentation.
 train_set = Subset(trainval_aug, train_idx.tolist())
 train_eval_set = Subset(trainval_plain, train_idx.tolist())  # same images, no augmentation (for train metrics)
 val_set = Subset(trainval_plain, val_idx.tolist())
 
 # Images per breed in each split (no class balancing is used)
+# Count how many images of each breed are present in each split.
 train_counts = np.bincount(labels[train_idx], minlength=NUM_CLASSES)
 val_counts = np.bincount(labels[val_idx], minlength=NUM_CLASSES)
 test_counts = np.bincount(test_set._labels, minlength=NUM_CLASSES)
+
 with open(OUT / "class_counts.csv", "w") as f:
     f.write("breed,train,val,test\n")
     for i, breed in enumerate(class_names):
@@ -86,6 +92,7 @@ print(f"Train/val overlap: {len(set(train_idx) & set(val_idx))} images")
 
 
 def make_loader(dataset, shuffle=False):
+    """Returns a DataLoader with its own seeded generator, so the batch order is reproducible."""
     generator = torch.Generator().manual_seed(SEED)
     return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle, generator=generator)
 
@@ -104,10 +111,12 @@ def build_model(strategy):
 
 
 def count_trainable(model):
+    """Counts the parameters of the model that are updated during training."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def now():
+    """Returns the current time in seconds, after waiting for any pending GPU work to finish."""
     if device.type == "cuda":
         torch.cuda.synchronize()
     return time.perf_counter()
@@ -115,6 +124,7 @@ def now():
 
 @torch.no_grad()
 def predict(model, loader):
+    """Runs the model in evaluation mode over a loader and returns (true labels, predicted labels)."""
     model.eval()
     y_true, y_pred = [], []
     for x, y in loader:
@@ -124,14 +134,13 @@ def predict(model, loader):
 
 
 def scores(y_true, y_pred):
+    """Returns accuracy and macro-averaged F1 (unweighted mean over the 37 breeds)."""
     return {"accuracy": accuracy_score(y_true, y_pred),
             "macro_f1": f1_score(y_true, y_pred, average="macro", labels=range(NUM_CLASSES), zero_division=0)}
 
 
-check = build_model("full").eval()(torch.zeros(2, 3, 224, 224).to(device))
-print(f"Output shape of the new model: {tuple(check.shape)}\n")
 
-# The three approaches (selection uses train/validation only)
+# Train both fine-tuning strategies and select the best epoch using validation accuracy.
 def train(strategy):
     """Trains with a fixed learning rate and keeps the epoch with the best validation accuracy."""
     set_seed()
@@ -181,8 +190,9 @@ for strategy, name in [("full", "Full fine-tuning"), ("head", "Classifier-head t
                    "trainable_layers": "all" if strategy == "full" else sorted({n.rsplit(".", 1)[0] for n in trainable})},
     }
 
-# Approach 3: frozen network -> 576-d features (after pooling) -> logistic regression
+# Third approach: use the pretrained network as a fixed feature extractor, then train logistic regression.
 extractor = models.mobilenet_v3_small(weights=weights)
+# Remove the classifier so the network outputs image features instead of class scores.
 extractor.classifier = nn.Identity()
 extractor = extractor.to(device).eval()
 for p in extractor.parameters():
@@ -191,19 +201,21 @@ for p in extractor.parameters():
 
 @torch.no_grad()
 def extract(loader):
+    """Passes the images through the frozen network and returns (576-d feature vectors, labels)."""
     feats, ys = [], []
     for x, y in loader:
         feats.append(extractor(x.to(device)).cpu().numpy())
         ys.append(y.numpy())
     return np.concatenate(feats), np.concatenate(ys)
 
-
+# Extract features once; the same representations are reused for all C values.
 features = {}
 start = now()
 features["train"] = extract(loaders["train"])
 extract_time = now() - start
 features["val"] = extract(loaders["val"])
 
+# Try a small set of regularization strengths and select the best one on validation data.
 best_acc = -1
 for C in (0.01, 0.1, 1.0):
     # the scaler is part of the pipeline, so it is fitted on the training features only
@@ -231,8 +243,9 @@ print(f"Logistic regression: best C {best_C}\n")
 loaders["test"] = make_loader(test_set)
 features["test"] = extract(loaders["test"])
 
-
+# Save a row-normalized confusion matrix so each row shows the prediction distribution for one breed.
 def plot_confusion(cm, title, path):
+    """Saves the confusion matrix, normalised by row, with the breed names on both axes."""
     fig, ax = plt.subplots(figsize=(11, 10))
     im = ax.imshow(cm / cm.sum(axis=1, keepdims=True), cmap="Blues")
     ax.set_xticks(range(NUM_CLASSES), class_names, rotation=90, fontsize=6)
@@ -243,7 +256,7 @@ def plot_confusion(cm, title, path):
     fig.savefig(path, dpi=200)
     plt.close(fig)
 
-
+# Save a few correct and incorrect test predictions for a visual inspection
 def plot_examples(y_true, y_pred, title, path, n=4):
     """Randomly chosen correct (top row) and incorrect (bottom row) test predictions."""
     rng = np.random.default_rng(SEED)
@@ -261,7 +274,7 @@ def plot_examples(y_true, y_pred, title, path, n=4):
     fig.savefig(path, dpi=200)
     plt.close(fig)
 
-
+# Evaluate each selected approach on train, validation, and test splits, then save its metrics.
 results = {}
 for key, s in selected.items():
     y_train, p_train = s["predict"]("train")
@@ -284,7 +297,7 @@ for key, s in selected.items():
         if errors[t, p] > 0:
             print(f"   {class_names[t]} -> {class_names[p]}: {errors[t, p]} images")
 
-# Results table
+# Build and save a Markdown table with the main results for all approaches.
 lines = ["| Approach | Trainable params | Train time (s) | Train acc | Val acc | Test acc | Test macro-F1 | Train-test gap |",
          "|---|---|---|---|---|---|---|---|"]
 for r in results.values():
@@ -296,4 +309,4 @@ table = "\n".join(lines)
 print("\n" + table)
 (OUT / "results_table.md").write_text(table + "\n")
 with open(OUT / "results.json", "w") as f:
-    json.dump({"versions": versions, "results": results}, f, indent=2, default=float)
+    json.dump({"results": results}, f, indent=2, default=float)
